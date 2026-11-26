@@ -1,373 +1,622 @@
-#!/usr/bin/env python
-# coding: utf-8
+"""
+Driver/Sensor/Dual/Ordinary node roles, maximum matching tie-breaking robustness,
+and Lin's structural controllability tests (input-connection + augmented matching)
+on the IEEE 118-bus power grid across a 24-hour dispatch cycle.
 
-# In[3]:
+Methodological notes:
+- Node indices match the 0-based pandapower bus indices.
+- Randomization performs vertex-ordering tie-breaking (permutation of bipartite vertex
+  labels with explicit random seeds), not uniform sampling over all maximum matchings.
+- Three matching procedures:
+    REF = identity permutation (deterministic baseline, independent of PYTHONHASHSEED)
+    A   = one random permutation per run, kept FIXED across all 24 hours
+    B   = independent random permutations resampled at EVERY hour
+- GRAPH_MODE:
+    "full"  = transmission lines + in-line transformers; parallel circuits collapsed onto
+              net active power flow per bus pair; zero flow defaults to from_bus -> to_bus.
+- TIEBREAK:
+    "left"  = permutes left-hand bipartite vertex orderings only.
+    "both"  = permutes both left-hand and right-hand bipartite vertex labels and sorts edges.
+- Output files are saved in a dedicated folder for each (GRAPH_MODE, TIEBREAK) configuration.
+"""
 
-
-import json
-import pandas as pd
-import numpy as np
 import os
-import pandapower as pp
+import re
+import random
+import warnings
+from datetime import datetime
+from collections import Counter
+
+import numpy as np
+import pandas as pd
 import networkx as nx
+import pandapower as pp
 from networkx.algorithms import bipartite
-import matplotlib.pyplot as plt
-from collections import defaultdict
+
+# ================================================================
+# 0. PARAMETERS
+# ================================================================
+SAMPLES_DIR = "data/samples"  # Set the directory containing the hourly JSON snapshots
+DAY = (2024, 1, 1)            # Target date; N_HOURS is inferred from available snapshots
+N_RUNS = 200                  # Number of Monte Carlo runs per variant
+SEED_BASE = 1000              # Seed for run k is SEED_BASE + k
+GRAPH_MODE = "full"           # "full" (lines + transformers) or "lines" (lines only)
+TIEBREAK = "both"             # "both" (two-sided label permutation) or "left"
+assert GRAPH_MODE in ("lines", "full") and TIEBREAK in ("left", "both")
+
+OUTPUT_DIR = os.path.join(SAMPLES_DIR, f"monte_carlo_results_{GRAPH_MODE}_{TIEBREAK}")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+INCLUDE_SGEN = False          # Whether to include static generators as physical inputs
+WATCH_NODE = 103              # Representative dynamic bus inspected hour-by-hour
+TOL = 1e-9                    # Threshold below which active power flow is treated as zero
+
+ROLES = ["Driver", "Sensor", "Dual", "Ordinary"]
+DRV, SNS, DUA, ORD = 0, 1, 2, 3
 
 
-# In[5]:
+# ================================================================
+# 1. DATA LOADING (CHRONOLOGICAL ORDER)
+# ================================================================
+def file_time(name):
+    m = re.match(r"(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})\.json$", name)
+    return datetime(*map(int, m.groups())) if m else None
 
 
-samples_dir = r"..." #put your own directory here
-json_files = ([f for f in os.listdir(samples_dir) if f.endswith('.json')])[:24] 
-history = defaultdict(list) 
-history_degrees = defaultdict(lambda: {'in': [], 'out': [], 'total': []})
-role_hub_auth = defaultdict(lambda: defaultdict(lambda: {'hub': [], 'auth': []}))  
+if not os.path.isdir(SAMPLES_DIR):
+    raise FileNotFoundError(
+        f"Directory '{SAMPLES_DIR}' not found. Please place the hourly JSON files there "
+        "or update SAMPLES_DIR."
+    )
+
+timed = sorted((file_time(f), f) for f in os.listdir(SAMPLES_DIR) if file_time(f))
+day_files = [(t, f) for t, f in timed if (t.year, t.month, t.day) == DAY]
+
+if len(day_files) < 2:
+    raise ValueError(f"Insufficient snapshots found for {DAY}: {len(day_files)}")
+
+json_files = [f for _, f in day_files]
+HOUR_LABELS = [t.hour for t, _ in day_files]
+N_HOURS = len(json_files)
+missing_hours = sorted(set(range(24)) - set(HOUR_LABELS))
+print(f"Date {DAY}: {N_HOURS} snapshots | missing hours: "
+      f"{missing_hours if missing_hours else 'none'}")
+print("Hours loaded:", HOUR_LABELS)
 
 
-for hour_file in json_files: 
-    net = pp.from_json(os.path.join(samples_dir, hour_file))
-
-    #create the digraph of the net for each of the 24 hours
-    G = nx.DiGraph() 
-    G.add_nodes_from(sorted(net.bus.index)) 
-    for idx, line in net.line.iterrows():
-        f, t = int(line['from_bus']), int(line['to_bus']) 
-        p_flow = net.res_line.loc[idx, 'p_from_mw'] 
-        if p_flow >= 0: G.add_edge(f, t) 
-        else: G.add_edge(t, f) 
-
-
-        h_score, a_score = nx.hits(G, max_iter=100, normalized=True) 
-    
-    #create bipartite graph for each of the 24 hours to use the hopcroft karp algorithm
-    nodi = list(G.nodes()) 
-    H = nx.Graph() 
-    nodi_l = [f"{n}_l" for n in nodi]
-    nodi_r = [f"{n}_r" for n in nodi]
-    H.add_nodes_from(nodi_l, bipartite=0) 
-    H.add_nodes_from(nodi_r, bipartite=1) 
-    for i, j in (G.edges()):  
-        H.add_edge(f"{i}_l", f"{j}_r")
-
-    matching = bipartite.hopcroft_karp_matching(H, top_nodes=set(nodi_l))
-
-    #classify the nodes based on matching results
-    for n in nodi:
-        is_driver = f"{n}_r" not in matching 
-        is_sensor = f"{n}_l" not in matching 
-
-        if is_driver and is_sensor: ruolo = "Dual" 
-        elif is_driver: ruolo = "Driver"
-        elif is_sensor: ruolo = "Sensor"
-        else: ruolo = "Ordinary" 
-        
-        history[n].append(ruolo) 
-        history_degrees[n]['in'].append(G.in_degree(n)) 
-        history_degrees[n]['out'].append(G.out_degree(n))
-        history_degrees[n]['total'].append(G.degree(n))
-        role_hub_auth[n][ruolo]['hub'].append(h_score[n])  
-        role_hub_auth[n][ruolo]['auth'].append(a_score[n])
-
-
-persistenza = []
-for n, roles in history.items():
-    total = len(roles) 
-    counts = pd.Series(roles).value_counts(normalize=True) * 100 
-    
-    unique_roles = set(roles) 
-    is_permanent = len(unique_roles) == 1
-    main_role = roles[0] if is_permanent else "Dynamic"
-    
-    persistenza.append({
-        'Node': n,
-        'Driver': counts.get('Driver', 0),
-        'Sensor': counts.get('Sensor', 0),
-        'Dual': counts.get('Dual', 0),
-        'Ordinary': counts.get('Ordinary', 0),
-        'Permanent': is_permanent,
-        'MainRole': roles[0]
-    })
-
-df_persist = pd.DataFrame(persistenza).sort_values(by='Node')
-
-#table for permanent nodes
-print("permanent nodes")
-perm = df_persist[df_persist['Permanent']] 
-for role in ["Driver", "Sensor", "Dual", "Ordinary"]:
-    nodes = perm[perm['MainRole'] == role]['Node'].tolist() 
-    print(f"{role}: {nodes}")
-
-#table for dynamic nodes
-print("dynamic nodes")
-dinamici = round(df_persist[~df_persist['Permanent']],2)
-print(dinamici[['Node', 'Driver', 'Sensor', 'Dual', 'Ordinary']].to_string(index=False))
-
-
-# In[13]:
-
-
-#mean
-nodo_ruolo = dict(zip(df_persist['Node'], df_persist['MainRole'])) 
-
-grado_nodi = []
-for n in G.nodes():
-    grado_nodi.append({
-        'Node': n,
-        'In_Degree':       np.mean(history_degrees[n]['in']),
-         
-        'Out_Degree':      np.mean(history_degrees[n]['out']),
-        'Total_Degree':    np.mean(history_degrees[n]['total']),
-        'Ds_total_Degree': np.std(history_degrees[n]['total']),
-        'Role': nodo_ruolo[n]
-    })
-df_degrees = pd.DataFrame(grado_nodi) 
-
-#mean degree given the node
-avg_deg = df_degrees.groupby('Role')[['Total_Degree']].mean().sort_values('Total_Degree') 
-print(avg_deg)
-
-balance = df_degrees.groupby('Role')[['In_Degree', 'Out_Degree']].mean()
-print(balance)
-
-role_counts = df_degrees['Role'].value_counts()
-print(role_counts)
-
-
-# In[21]:
-
-
-#calculate coefficient of variation and standard deviation
-roles_list = ['Driver', 'Sensor', 'Dual', 'Ordinary']
-
-grado_per_ruolo = {r: {'in': 0, 'out': 0, 'total': 0, 'n_nodi': 0} for r in roles_list}
-scarti_quadratici = {r: {'in': 0, 'out': 0, 'total': 0} for r in roles_list}
-
-for ora in range(24):
-    for ruolo in roles_list:
-        nodi_ruolo_ora = [n for n in G.nodes() if history[n][ora] == ruolo]
-        
-        if len(nodi_ruolo_ora) == 0:
+def injection_buses(net):
+    """Return in-service physical generation/slack injection buses."""
+    tables = ["gen", "ext_grid"] + (["sgen"] if INCLUDE_SGEN else [])
+    buses = set()
+    for t in tables:
+        df = net[t]
+        if len(df) == 0:
             continue
-        
-        grado_per_ruolo[ruolo]['in']     += sum(history_degrees[n]['in'][ora]     for n in nodi_ruolo_ora)
-        grado_per_ruolo[ruolo]['out']    += sum(history_degrees[n]['out'][ora]    for n in nodi_ruolo_ora)
-        grado_per_ruolo[ruolo]['total'] += sum(history_degrees[n]['total'][ora] for n in nodi_ruolo_ora)
-        grado_per_ruolo[ruolo]['n_nodi'] += len(nodi_ruolo_ora)
+        if "in_service" in df.columns:
+            df = df[df["in_service"]]
+        buses.update(int(b) for b in df["bus"])
+    return buses
 
-medie = {}
-for ruolo in roles_list:
-    n = grado_per_ruolo[ruolo]['n_nodi']
-    medie[ruolo] = {
-        'in':     grado_per_ruolo[ruolo]['in']     / n if n > 0 else 0,
-        'out':    grado_per_ruolo[ruolo]['out']    / n if n > 0 else 0,
-        'total': grado_per_ruolo[ruolo]['total'] / n if n > 0 else 0,
+
+def build_edges(net, mode=None):
+    """Build directed edges oriented according to active power flow."""
+    mode = mode or GRAPH_MODE
+    if mode == "lines":
+        edges = {}
+        for idx, r in net.line.iterrows():
+            if "in_service" in net.line.columns and not r["in_service"]:
+                continue
+            f, t = int(r["from_bus"]), int(r["to_bus"])
+            e = (f, t) if float(net.res_line.loc[idx, "p_from_mw"]) >= 0 else (t, f)
+            if e[0] != e[1]:
+                edges[e] = None
+        return list(edges)
+
+    pairs = {}  # (min_bus, max_bus) -> [default_from, default_to, net_active_flow]
+
+    def add(f, t, p):
+        if f == t:
+            return
+        key = (min(f, t), max(f, t))
+        if key not in pairs:
+            pairs[key] = [f, t, p]
+        elif (f, t) == (pairs[key][0], pairs[key][1]):
+            pairs[key][2] += p
+        else:
+            pairs[key][2] -= p
+
+    for idx, r in net.line.iterrows():
+        if "in_service" in net.line.columns and not r["in_service"]:
+            continue
+        add(int(r["from_bus"]), int(r["to_bus"]),
+            float(net.res_line.loc[idx, "p_from_mw"]))
+
+    if len(net.trafo) > 0:
+        for idx, r in net.trafo.iterrows():
+            if "in_service" in net.trafo.columns and not r["in_service"]:
+                continue
+            add(int(r["hv_bus"]), int(r["lv_bus"]),
+                float(net.res_trafo.loc[idx, "p_hv_mw"]))
+
+    edges = []
+    for f, t, p in pairs.values():
+        edges.append((t, f) if p < -TOL else (f, t))
+    return edges
+
+
+hours = []
+for h, fname in enumerate(json_files):
+    net = pp.from_json(os.path.join(SAMPLES_DIR, fname))
+    nodes = sorted(int(b) for b in net.bus.index)
+    idx = {b: i for i, b in enumerate(nodes)}
+    edges_bus = build_edges(net)
+    edges_by_mode = {m: build_edges(net, m) for m in ("lines", "full")}
+    if h == 0:
+        oos = int((~net.line["in_service"]).sum()) if "in_service" in net.line.columns else 0
+        print(f"Hour 0: {len(net.line)} lines ({oos} out of service), {len(net.trafo)} transformers, "
+              f"{len(edges_bus)} directed edges | graph mode: {GRAPH_MODE} | tie-breaking: {TIEBREAK}")
+        print("Edge count at hour 0 by mode:", {m: len(e) for m, e in edges_by_mode.items()})
+    src = np.array([idx[a] for a, _ in edges_bus])
+    dst = np.array([idx[b] for _, b in edges_bus])
+
+    G = nx.DiGraph()
+    G.add_nodes_from(nodes)
+    G.add_edges_from(edges_bus)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        hub, auth = nx.hits(G, max_iter=1000, normalized=True)
+
+    gen_b = injection_buses(net)
+    hours.append({
+        "hour": h, "nodes": nodes, "idx": idx,
+        "edges_bus": edges_bus, "edges_by_mode": edges_by_mode, "src": src, "dst": dst,
+        "in_deg": np.array([G.in_degree(b) for b in nodes]),
+        "out_deg": np.array([G.out_degree(b) for b in nodes]),
+        "hub": np.array([hub[b] for b in nodes]),
+        "auth": np.array([auth[b] for b in nodes]),
+        "gen_buses": sorted(gen_b),
+        "is_gen": np.array([b in gen_b for b in nodes]),
+        "G": G,
+    })
+
+NODES = hours[0]["nodes"]
+N = len(NODES)
+for d in hours:
+    if d["nodes"] != NODES:
+        raise ValueError(f"Bus set mismatch at hour {d['hour']}.")
+
+print(f"Snapshots: {N_HOURS} | buses: {N} | runs per variant: {N_RUNS}")
+print("Directed edges per hour (min/max):",
+      min(len(d["edges_bus"]) for d in hours),
+      max(len(d["edges_bus"]) for d in hours),
+      "| physical injection buses (hour 0):", len(hours[0]["gen_buses"]))
+_e0 = set(hours[0]["edges_bus"])
+print("Bidirectional bus pairs (hour 0):",
+      sum(1 for (a, b) in _e0 if (b, a) in _e0) // 2)
+if WATCH_NODE not in NODES:
+    raise ValueError("WATCH_NODE not found among network buses.")
+WATCH_I = NODES.index(WATCH_NODE)
+
+
+# ================================================================
+# 2. MAXIMUM BIPARTITE MATCHING & NODE ROLE CLASSIFICATION
+# ================================================================
+def matching_roles(d, perm_L, perm_R):
+    """
+    Compute maximum bipartite matching via Hopcroft-Karp under vertex permutations
+    perm_L and perm_R, and classify each bus into Driver, Sensor, Dual, or Ordinary.
+    """
+    edges = [(int(perm_L[s]), N + int(perm_R[t]))
+             for s, t in zip(d["src"], d["dst"])]
+    if TIEBREAK == "both":
+        edges.sort()
+    H = nx.Graph()
+    H.add_nodes_from(range(N), bipartite=0)
+    H.add_nodes_from(range(N, 2 * N), bipartite=1)
+    H.add_edges_from(edges)
+    m = bipartite.hopcroft_karp_matching(H, top_nodes=range(N))
+
+    matched_L = np.array([perm_L[i] in m for i in range(N)])
+    matched_R = np.array([(N + perm_R[i]) in m for i in range(N)])
+    size = int(matched_L.sum())
+
+    # Consistency assertions
+    assert size == int(matched_R.sum()), "Left/Right matching cardinality mismatch"
+    assert all(m[m[u]] == u for u in m), "Asymmetric matching dictionary"
+
+    driver, sensor = ~matched_R, ~matched_L
+    roles = np.full(N, ORD)
+    roles[driver] = DRV
+    roles[sensor] = SNS
+    roles[driver & sensor] = DUA
+
+    # Identity check: n - |M| = #Driver + #Dual = #Sensor + #Dual
+    assert (roles == DRV).sum() + (roles == DUA).sum() == N - size
+    assert (roles == SNS).sum() + (roles == DUA).sum() == N - size
+    return roles, size
+
+
+IDENT = list(range(N))
+
+
+def draw_perms(rng):
+    pL = rng.sample(IDENT, N)
+    pR = rng.sample(IDENT, N) if TIEBREAK == "both" else IDENT
+    return pL, pR
+
+
+def one_run(variant, seed=None):
+    """Execute one 24-hour run for variant 'REF', 'A', or 'B'."""
+    roles = np.zeros((N_HOURS, N), dtype=int)
+    sizes = np.zeros(N_HOURS, dtype=int)
+    rng = random.Random(seed) if seed is not None else None
+    if variant == "A":
+        pL, pR = draw_perms(rng)
+    for d in hours:
+        if variant == "REF":
+            pL, pR = IDENT, IDENT
+        elif variant == "B":
+            pL, pR = draw_perms(rng)
+        roles[d["hour"]], sizes[d["hour"]] = matching_roles(d, pL, pR)
+    return roles, sizes
+
+
+# ================================================================
+# 3. RUN-LEVEL SUMMARY METRICS
+# ================================================================
+def summarize(roles):
+    row = {}
+    # Network-level role persistence across all 24 hours
+    persistent = (roles == roles[0]).all(axis=0)
+    row["persistent_nodes"] = int(persistent.sum())
+    row["persistence_pct"] = 100 * persistent.mean()
+
+    # Heuristic generator coverage (share of Driver/Dual node-hours on generator buses)
+    dd = (roles == DRV) | (roles == DUA)
+    gen = np.array([d["is_gen"] for d in hours])
+    row["generator_coverage_pct"] = 100 * (dd & gen).sum() / dd.sum()
+
+    in_d = np.array([d["in_deg"] for d in hours])
+    out_d = np.array([d["out_deg"] for d in hours])
+    hub = np.array([d["hub"] for d in hours])
+    auth = np.array([d["auth"] for d in hours])
+    tot_d = in_d + out_d
+
+    for r, name in enumerate(ROLES):
+        mk = roles == r
+        n_obs = int(mk.sum())
+        row[f"{name}_obs"] = n_obs
+        row[f"{name}_share_pct"] = 100 * n_obs / roles.size
+        if n_obs == 0:
+            continue
+        for lab, arr in (("in", in_d), ("out", out_d), ("tot", tot_d)):
+            v = arr[mk].astype(float)
+            mu = v.mean()
+            sd = v.std(ddof=1) if n_obs > 1 else 0.0
+            row[f"{name}_{lab}_mean"] = mu
+            row[f"{name}_{lab}_std"] = sd
+            row[f"{name}_{lab}_cv"] = sd / mu if mu > 0 else np.nan
+        row[f"{name}_hub_mean"] = hub[mk].mean()
+        row[f"{name}_auth_mean"] = auth[mk].mean()
+        row[f"{name}_in_gt_out_pct"] = 100 * (in_d[mk] > out_d[mk]).mean()
+        row[f"{name}_out_gt_in_pct"] = 100 * (out_d[mk] > in_d[mk]).mean()
+        row[f"{name}_eq_pct"] = 100 * (in_d[mk] == out_d[mk]).mean()
+        if n_obs > 2 and in_d[mk].std() > 0 and out_d[mk].std() > 0:
+            row[f"{name}_corr_in_out"] = np.corrcoef(in_d[mk], out_d[mk])[0, 1]
+        else:
+            row[f"{name}_corr_in_out"] = np.nan
+
+    # Role-to-role directed edge adjacency matrix (%)
+    E = np.zeros((4, 4))
+    for d in hours:
+        np.add.at(E, (roles[d["hour"]][d["src"]], roles[d["hour"]][d["dst"]]), 1)
+    E = 100 * E / E.sum()
+    for a in range(4):
+        for b in range(4):
+            row[f"edge_{ROLES[a]}_to_{ROLES[b]}_pct"] = E[a, b]
+    return row
+
+
+# ================================================================
+# 4. EXECUTION: DETERMINISTIC REFERENCE (REF) AND MONTE CARLO (A, B)
+# ================================================================
+print("Running deterministic reference matching...")
+ref_roles, ref_sizes = one_run("REF")
+ref_row = summarize(ref_roles)
+print(f"REF persistence: {ref_row['persistence_pct']:.2f}% | "
+      f"generator coverage: {ref_row['generator_coverage_pct']:.2f}%")
+
+results = {}
+for variant in ("A", "B"):
+    print(f"
+Running Monte Carlo Variant {variant} ({N_RUNS} runs)...")
+    rows, role_counts = [], np.zeros((N, 4), dtype=int)
+    watch_hour = np.zeros((N_HOURS, 4), dtype=int)
+    for k in range(N_RUNS):
+        seed = SEED_BASE + k
+        roles, sizes = one_run(variant, seed)
+        if not np.array_equal(sizes, ref_sizes):
+            raise AssertionError(
+                f"Matching cardinality differs from reference (variant {variant}, seed {seed})."
+            )
+        r = summarize(roles)
+        r.update({"variant": variant, "run": k, "seed": seed})
+        rows.append(r)
+        for rr in range(4):
+            role_counts[:, rr] += (roles == rr).sum(axis=0)
+            watch_hour[:, rr] += (roles[:, WATCH_I] == rr)
+        if (k + 1) % 50 == 0:
+            print(f"  completed {k + 1}/{N_RUNS}")
+    results[variant] = {
+        "runs": pd.DataFrame(rows),
+        "counts": role_counts,
+        "watch": watch_hour,
     }
 
-for ora in range(24):
-    for ruolo in roles_list:
-        nodi_ruolo_ora = [n for n in G.nodes() if history[n][ora] == ruolo]
-        
-        if len(nodi_ruolo_ora) == 0:
-            continue
-        
-        scarti_quadratici[ruolo]['in']     += sum((history_degrees[n]['in'][ora]     - medie[ruolo]['in'])**2     for n in nodi_ruolo_ora)
-        scarti_quadratici[ruolo]['out']    += sum((history_degrees[n]['out'][ora]    - medie[ruolo]['out'])**2    for n in nodi_ruolo_ora)
-        scarti_quadratici[ruolo]['total'] += sum((history_degrees[n]['total'][ora] - medie[ruolo]['total'])**2 for n in nodi_ruolo_ora)
 
-risultati = []
-for ruolo in roles_list:
-    n = grado_per_ruolo[ruolo]['n_nodi']
-    
-    std_in     = np.sqrt(scarti_quadratici[ruolo]['in']     / (n-1)) if n > 0 else 0
-    std_out    = np.sqrt(scarti_quadratici[ruolo]['out']    / (n-1)) if n > 0 else 0
-    std_totale = np.sqrt(scarti_quadratici[ruolo]['total'] / (n-1)) if n > 0 else 0
-    
-    risultati.append({
-        'Role':          ruolo,
-        'In_Degree':      medie[ruolo]['in'],
-        'Out_Degree':     medie[ruolo]['out'],
-        'Total_Degree':   medie[ruolo]['total'],
-        'Dev_Standard_Tot' : std_totale,
-        'Dev_Standard_In': std_in,
-        'Dev_Standard_Out' : std_out,
-        'CV_In':          std_in     / medie[ruolo]['in']     if medie[ruolo]['in']     > 0 else 0,
-        'CV_Out':         std_out    / medie[ruolo]['out']    if medie[ruolo]['out']    > 0 else 0,
-        'CV_Total':       std_totale / medie[ruolo]['total'] if medie[ruolo]['total'] > 0 else 0,
-    })
-
-df_avg = pd.DataFrame(risultati).set_index('Role')
-print(df_avg.sort_values('Total_Degree'))
-
-
-# In[25]:
-
-
-#plot to see how roles change for node 108
-nodo = 108
-ore = list(range(24))
-in_deg = history_degrees[nodo]['in']
-out_deg = history_degrees[nodo]['out']
-ruoli = history[nodo]
-
-plt.figure(figsize=(9, 3.5))
-plt.plot(ore, in_deg, label='In-degree', marker='o', color='tab:blue')
-plt.plot(ore, out_deg, label='Out-degree', marker='s', linestyle='--', color='tab:orange')
-
-
-for ora in ore:
-    plt.text(ora, 2.3, ruoli[ora][0], fontsize=8, ha='center', color='gray')
-
-plt.title(f'Node {nodo} - In/Out degree over 24h')
-plt.xlabel('Hour')
-plt.ylabel('Degree')
-plt.xticks(ore)
-plt.yticks([0, 1, 2, 3])
-plt.grid(True, linestyle=':', alpha=0.6)
-plt.legend(loc='upper right')
-plt.tight_layout()
-plt.savefig(f'degree_nodo_{nodo}.pdf')
-plt.show()
-
-print(f"Ruoli nodo {nodo} nelle 24 ore:")
-for ora, r in enumerate(ruoli):
-    print(f"  Ora {ora:2d}: {r:10s} | in={in_deg[ora]}  out={out_deg[ora]}")
-
-
-# In[22]:
-
-
-#table (degree given node)
-risultati2 = {'Driver': [], 'Sensor': [], 'Dual': [], 'Ordinary': []}
-
-for nodo, roles in history.items():
-    in_degs  = history_degrees[nodo]['in']
-    out_degs = history_degrees[nodo]['out']
-    
-    for ora in range(24):
-        ruolo   = roles[ora]
-        in_deg  = in_degs[ora]
-        out_deg = out_degs[ora]
-        
-        if in_deg > out_deg:
-            condizione = 'in>out'
-        elif out_deg > in_deg:
-            condizione = 'out>in'
-        else:
-            condizione = 'in==out'
-        
-        risultati2[ruolo].append(condizione)
-
-for ruolo, condizioni_lista in risultati2.items():
-    totale = len(condizioni_lista)
-    counts = pd.Series(condizioni_lista).value_counts(normalize=True) * 100
-    print(f"\n{ruolo} ({totale} osservazioni):")
-    for condizione in ['in>out', 'out>in', 'in==out']:
-        print(f"  {condizione:10s}: {counts.get(condizione, 0):.1f}%")
-
-
-# In[45]:
-
-
-gen_rows = []
-
-for hour_idx, hour_file in enumerate(json_files):
-    net = pp.from_json(os.path.join(samples_dir, hour_file))
-    bus_con_gen = set(net.gen['bus'].tolist() + net.ext_grid['bus'].tolist())
-    nodi_ora = list(G.nodes())  
-    ruoli_ora = {n: history[n][hour_idx] for n in nodi_ora}
-    
-    driver_ora = [n for n, r in ruoli_ora.items() if r == 'Driver']
-    dual_ora   = [n for n, r in ruoli_ora.items() if r == 'Dual']
-    
-    gen_rows.append({
-        'Ora':            hour_idx,
-        'N_Driver':       len(driver_ora),
-        'N_Dual':         len(dual_ora),
-        'Driver_con_gen': sum(1 for n in driver_ora if n in bus_con_gen),
-        'Dual_con_gen':   sum(1 for n in dual_ora   if n in bus_con_gen),
-    })
-
-df_gen = pd.DataFrame(gen_rows)
-
-
-# In[51]:
-
-
-df_gen['Tot_driver_dual']=df_gen['N_Driver'] + df_gen['N_Dual']
-df_gen['Tot_con_gen']=df_gen['Driver_con_gen'] + df_gen['Dual_con_gen']
-
-media=round(df_gen['Tot_con_gen'].sum() / df_gen['Tot_driver_dual'].sum() * 100, 2)
-
-print(media)
-
-
-# In[41]:
-
-
-#hub and authority scores
-results_hits = []
-for n in history.keys():
-    for ruolo, scores in role_hub_auth[n].items():
-        results_hits.append({
-            'Nodo': n,
-            'Ruolo': ruolo,
-            'Hub_Medio': np.mean(scores['hub']),
-            'Auth_Medio': np.mean(scores['auth'])
+# ================================================================
+# 5. REFERENCE vs MONTE CARLO COMPARISON AND CORE NODES
+# ================================================================
+total_assign = N_RUNS * N_HOURS
+summary_rows = []
+for variant in ("A", "B"):
+    df = results[variant]["runs"]
+    for metric in ("persistence_pct", "persistent_nodes", "generator_coverage_pct"):
+        pct_rank = 100 * (df[metric] < ref_row[metric]).mean()
+        summary_rows.append({
+            "variant": variant, "metric": metric,
+            "reference": ref_row[metric],
+            "MC_mean": df[metric].mean(), "MC_std": df[metric].std(ddof=1),
+            "MC_min": df[metric].min(), "MC_max": df[metric].max(),
+            "reference_percentile_in_MC": pct_rank,
         })
+summary_df = pd.DataFrame(summary_rows)
+print("
+===== REFERENCE vs MONTE CARLO =====")
+print(summary_df.round(3).to_string(index=False))
 
-df_hits = pd.DataFrame(results_hits)
-stats_hits = df_hits.groupby('Ruolo')[['Hub_Medio', 'Auth_Medio']].mean()
-print(stats_hits.sort_values(by='Auth_Medio'))
+core = {}
+for variant in ("A", "B"):
+    cnt = results[variant]["counts"]
+    is_core = cnt.max(axis=1) == total_assign
+    core[variant] = {
+        r: [NODES[i] for i in range(N) if is_core[i] and cnt[i].argmax() == k]
+        for k, r in enumerate(ROLES)
+    }
+    print(f"
+Core nodes in Variant {variant}: {int(is_core.sum())}")
+    for r in ROLES:
+        print(f"  {r}: {len(core[variant][r])} {core[variant][r]}")
 
-
-# In[34]:
-
-
-#plot to compare hub and authority scores 
-baseline = 1 / 118
-stats_hits['Hub_vs_baseline'] = stats_hits['Hub_Medio'] / baseline
-stats_hits['Auth_vs_baseline'] = stats_hits['Auth_Medio'] / baseline
-
-ax = stats_hits[['Hub_vs_baseline', 'Auth_vs_baseline']].plot(
-    kind='bar',
-    figsize=(7, 4),
-    color=['tab:blue', 'tab:orange'],
-    rot=0
-)
-
-plt.axhline(y=1, color='gray', linestyle='--', linewidth=1, label='Baseline')
-plt.ylabel('Ratio to baseline (1/118)')
-plt.xlabel('Role')
-plt.title('Normalized Hub and Authority Scores')
-plt.legend(['Hub Score', 'Authority Score', 'Baseline'])
-plt.grid(axis='y', linestyle=':', alpha=0.5)
-plt.tight_layout()
-plt.show()
-
-
-# In[13]:
+# Consistency check against deterministic reference
+for variant in ("A", "B"):
+    cnt = results[variant]["counts"]
+    bad = []
+    for i in range(N):
+        if cnt[i].max() == total_assign:
+            core_role = int(cnt[i].argmax())
+            if not (ref_roles[:, i] == core_role).all():
+                bad.append(NODES[i])
+    print(f"Core vs reference inconsistencies (Variant {variant}):", bad if bad else "none")
 
 
-#Mean hub and authority scores
-hits_per_ruolo = {r: {'hub': 0, 'auth': 0, 'n_obs': 0} for r in ['Driver', 'Sensor', 'Dual', 'Ordinary']}
+# ================================================================
+# 6. LIN TESTS FOR MULTI-INPUT LINEAR SYSTEMS
+# ================================================================
+def lin_tests(mode):
+    """
+    Evaluate Lin's structural controllability conditions (input-connection + rank condition
+    via augmented bipartite matching) for graph mode ('lines' or 'full').
+    """
+    rows = []
+    for d in hours:
+        edges, idx, gens = d["edges_by_mode"][mode], d["idx"], d["gen_buses"]
+        src = [idx[a] for a, _ in edges]
+        dst = [idx[b] for _, b in edges]
+        G = nx.DiGraph()
+        G.add_nodes_from(NODES)
+        G.add_edges_from(edges)
 
-for n in history.keys():
-    for ruolo, scores in role_hub_auth[n].items():
-        hits_per_ruolo[ruolo]['hub']   += sum(scores['hub'])   
-        hits_per_ruolo[ruolo]['auth']  += sum(scores['auth'])  
-        hits_per_ruolo[ruolo]['n_obs'] += len(scores['hub'])  
+        # (i) Input-connection condition
+        reached = set(gens)
+        for g in gens:
+            reached |= nx.descendants(G, g)
+        unreached = sorted(set(NODES) - reached)
 
-# Divido alla fine
-risultati_hits = []
-for ruolo, vals in hits_per_ruolo.items():
-    n = vals['n_obs']
-    risultati_hits.append({
-        'Ruolo':      ruolo,
-        'Hub_Medio':  vals['hub']  / n if n > 0 else 0,
-        'Auth_Medio': vals['auth'] / n if n > 0 else 0,
+        # State bipartite graph matching size |M_t|
+        H0 = nx.Graph()
+        H0.add_nodes_from(range(N), bipartite=0)
+        H0.add_nodes_from(range(N, 2 * N), bipartite=1)
+        H0.add_edges_from((s, N + t) for s, t in zip(src, dst))
+        M = len(bipartite.hopcroft_karp_matching(H0, top_nodes=range(N))) // 2
+
+        # (ii) Rank condition via augmented bipartite graph V(Sigma_t)
+        n_in = len(gens)
+        R0 = N + n_in
+        H = nx.Graph()
+        H.add_nodes_from(range(R0), bipartite=0)
+        H.add_nodes_from(range(R0, R0 + N), bipartite=1)
+        for s_, t_ in zip(src, dst):
+            H.add_edge(s_, R0 + t_)
+        for k, g in enumerate(gens):
+            H.add_edge(N + k, R0 + idx[g])
+        m = bipartite.hopcroft_karp_matching(H, top_nodes=range(R0))
+        covered = sum(1 for i in range(N) if (R0 + i) in m)
+
+        rows.append({
+            "graph": mode, "hour": d["hour"], "clock_hour": HOUR_LABELS[d["hour"]],
+            "n_edges": len(edges), "n_inputs": n_in,
+            "reached": len(reached), "reach_ok": len(reached) == N,
+            "unreached_nodes": unreached,
+            "aug_matching": covered, "match_ok": covered == N,
+            "rank_defect": N - covered,
+            "base_matching": M,
+            "frac_deficit_covered": (covered - M) / (N - M),
+            "controllable_Lin": (len(reached) == N) and (covered == N),
+        })
+    return pd.DataFrame(rows)
+
+
+lin_dfs = {m: lin_tests(m) for m in ("lines", "full")}
+for m, ldf in lin_dfs.items():
+    print(f"
+===== LIN TESTS - graph '{m}' =====")
+    print(ldf.drop(columns=["unreached_nodes", "graph"]).round(3).to_string(index=False))
+    print("Unreachable nodes (hour 0):", ldf.loc[0, "unreached_nodes"])
+    print(f"Structurally controllable hours: {int(ldf['controllable_Lin'].sum())}/{N_HOURS}")
+
+
+# ================================================================
+# 7. CSV EXPORT
+# ================================================================
+ref_df = pd.DataFrame([ref_row])
+ref_df.insert(0, "variant", "REF")
+
+node_rows = []
+for variant in ("A", "B"):
+    cnt = results[variant]["counts"]
+    for i in range(N):
+        ref_set = set(ref_roles[:, i])
+        row = {
+            "variant": variant,
+            "node": NODES[i],
+            "ref_role": ROLES[ref_roles[0, i]] if len(ref_set) == 1 else "dynamic",
+        }
+        for k, r in enumerate(ROLES):
+            row[f"{r}_pct"] = 100 * cnt[i, k] / total_assign
+        row["core"] = cnt[i].max() == total_assign
+        node_rows.append(row)
+
+watch_rows = []
+for variant in ("A", "B"):
+    for h in range(N_HOURS):
+        row = {
+            "variant": variant,
+            "hour": h,
+            "clock_hour": HOUR_LABELS[h],
+            "ref_role": ROLES[ref_roles[h, WATCH_I]],
+            "in_degree": int(hours[h]["in_deg"][WATCH_I]),
+            "out_degree": int(hours[h]["out_deg"][WATCH_I]),
+        }
+        for k, r in enumerate(ROLES):
+            row[f"{r}_pct"] = 100 * results[variant]["watch"][h, k] / N_RUNS
+        watch_rows.append(row)
+
+tables = {
+    "summary_ref_vs_MC.csv": summary_df,
+    "reference_stats.csv": ref_df,
+    "MC_runs_A.csv": results["A"]["runs"],
+    "MC_runs_B.csv": results["B"]["runs"],
+    "node_role_frequencies.csv": pd.DataFrame(node_rows),
+    f"node{WATCH_NODE}_by_hour.csv": pd.DataFrame(watch_rows),
+    "lin_tests_lines.csv": lin_dfs["lines"],
+    "lin_tests_full.csv": lin_dfs["full"],
+}
+for fname, tab in tables.items():
+    tab.to_csv(os.path.join(OUTPUT_DIR, fname), index=False)
+
+print("Exported files to:", OUTPUT_DIR)
+for fname in tables:
+    print(" -", fname)
+
+
+# ================================================================
+# 8. FORMATTED SUMMARY FOR MANUSCRIPT TABLES & FIGURES
+# ================================================================
+print("TABLE 1: TIME-INVARIANT NODES (DETERMINISTIC REFERENCE)")
+print("=" * 75)
+perm_nodes_by_role = {r: [] for r in ROLES}
+dynamic_nodes = []
+
+for i in range(N):
+    b_id = NODES[i]
+    roles_24h = ref_roles[:, i]
+    if len(set(roles_24h)) == 1:
+        perm_nodes_by_role[ROLES[roles_24h[0]]].append(b_id)
+    else:
+        dynamic_nodes.append((i, b_id))
+
+tot_perm = sum(len(v) for v in perm_nodes_by_role.values())
+print(f"Total time-invariant nodes in Reference: {tot_perm} / {N} ({100 * tot_perm / N:.2f}%)")
+for r in ROLES:
+    print(f"\\textbf{{{r}}} & {', '.join(str(x) for x in perm_nodes_by_role[r])} \\\\")
+
+print("
+" + "=" * 75)
+print("TABLE 2: DYNAMIC NODES (DETERMINISTIC REFERENCE - hourly share %)")
+print("=" * 75)
+dyn_rows = []
+for i, b_id in dynamic_nodes:
+    roles_24h = ref_roles[:, i]
+    counts = Counter(roles_24h)
+    dyn_rows.append({
+        "Node": b_id,
+        "Driver": f"{100 * counts[DRV] / N_HOURS:.1f}" if counts[DRV] > 0 else "--",
+        "Sensor": f"{100 * counts[SNS] / N_HOURS:.1f}" if counts[SNS] > 0 else "--",
+        "Dual": f"{100 * counts[DUA] / N_HOURS:.1f}" if counts[DUA] > 0 else "--",
+        "Ordinary": f"{100 * counts[ORD] / N_HOURS:.1f}" if counts[ORD] > 0 else "--",
     })
+df_dyn_print = pd.DataFrame(dyn_rows).sort_values("Node")
+for _, row in df_dyn_print.iterrows():
+    print(f"{row['Node']:3d} & {row['Driver']:5s} & {row['Sensor']:5s} & {row['Dual']:5s} & {row['Ordinary']:5s} \\\\")
 
-df_hits = pd.DataFrame(risultati_hits).set_index('Ruolo')
-print(df_hits.sort_values('Auth_Medio'))
+print("
+" + "=" * 75)
+print(f"FIGURE 1: CASE STUDY NODE {WATCH_NODE}")
+print("=" * 75)
+watch_coords_in = []
+watch_coords_out = []
+watch_role_labels = []
 
+for h in range(N_HOURS):
+    r_name = ROLES[ref_roles[h, WATCH_I]]
+    in_d = int(hours[h]["in_deg"][WATCH_I])
+    out_d = int(hours[h]["out_deg"][WATCH_I])
+    clk_h = HOUR_LABELS[h]
+    watch_coords_in.append(f"({clk_h},{in_d})")
+    watch_coords_out.append(f"({clk_h},{out_d})")
+    watch_role_labels.append(f"\\node at (axis cs:{clk_h}, 2.5) {{\\tiny {r_name[0]}}};")
+    print(f"Hour {clk_h:2d} -> Role={r_name:8s} | In={in_d} | Out={out_d}")
+
+print("
+--- TikZ \\addplot coordinates (in-degree):")
+print(" ".join(watch_coords_in))
+print("
+--- TikZ \\addplot coordinates (out-degree):")
+print(" ".join(watch_coords_out))
+print("
+--- TikZ role labels:")
+print(" ".join(watch_role_labels))
+
+print("
+" + "=" * 75)
+print("TABLE 3: CONDITIONAL DEGREE FREQUENCY BY ROLE (REFERENCE)")
+print("=" * 75)
+for r in ROLES:
+    sub_in_gt = ref_row[f"{r}_in_gt_out_pct"]
+    sub_out_gt = ref_row[f"{r}_out_gt_in_pct"]
+    sub_eq = ref_row[f"{r}_eq_pct"]
+    print(f"{r:8s} & {sub_in_gt:5.1f} & {sub_out_gt:5.1f} & {sub_eq:5.1f} \\\\")
+
+print("
+" + "=" * 75)
+print("TABLES 4, 5, 6: MEAN DEGREE, STANDARD DEVIATION, AND CV (REFERENCE)")
+print("=" * 75)
+for r in ROLES:
+    t_m, t_s, t_cv = ref_row[f"{r}_tot_mean"], ref_row[f"{r}_tot_std"], ref_row[f"{r}_tot_cv"]
+    i_m, i_s, i_cv = ref_row[f"{r}_in_mean"], ref_row[f"{r}_in_std"], ref_row[f"{r}_in_cv"]
+    o_m, o_s, o_cv = ref_row[f"{r}_out_mean"], ref_row[f"{r}_out_std"], ref_row[f"{r}_out_cv"]
+    print(f"{r:8s} -> Tot: {t_m:.2f} (std {t_s:.2f}, CV {t_cv:.2f}) | In: {i_m:.2f} (std {i_s:.2f}, CV {i_cv:.2f}) | Out: {o_m:.2f} (std {o_s:.2f}, CV {o_cv:.2f})")
+
+print("
+" + "=" * 75)
+print("FIGURE 2: HITS CENTRALITIES (REFERENCE)")
+print("=" * 75)
+for r in ROLES:
+    h_val = ref_row[f"{r}_hub_mean"]
+    a_val = ref_row[f"{r}_auth_mean"]
+    print(f"({r}, {h_val:.6f})  % Hub Score")
+    print(f"({r}, {a_val:.6f})  % Authority Score")
+
+print("
+Analysis completed successfully.")
